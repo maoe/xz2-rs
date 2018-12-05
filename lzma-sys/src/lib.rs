@@ -20,6 +20,7 @@ pub type lzma_check = __enum_ty;
 pub type lzma_vli = u64;
 pub type lzma_mode = __enum_ty;
 pub type lzma_match_finder = __enum_ty;
+pub type lzma_index_iter_mode = __enum_ty;
 
 pub const LZMA_OK: lzma_ret = 0;
 pub const LZMA_STREAM_END: lzma_ret = 1;
@@ -92,6 +93,13 @@ pub const LZMA_FILTER_ARMTHUMB: lzma_vli = 0x08;
 pub const LZMA_FILTER_SPARC: lzma_vli = 0x09;
 pub const LZMA_FILTER_LZMA1: lzma_vli = 0x4000000000000001;
 pub const LZMA_FILTER_LZMA2: lzma_vli = 0x21;
+
+pub const LZMA_STREAM_HEADER_SIZE: u32 = 12;
+
+pub const LZMA_INDEX_ITER_ANY: lzma_index_iter_mode = 0;
+pub const LZMA_INDEX_ITER_STREAM: lzma_index_iter_mode = 1;
+pub const LZMA_INDEX_ITER_BLOCK: lzma_index_iter_mode = 2;
+pub const LZMA_INDEX_ITER_NONEMPTY_BLOCK: lzma_index_iter_mode = 3;
 
 #[repr(C)]
 pub struct lzma_allocator {
@@ -213,6 +221,108 @@ pub struct lzma_stream_flags {
 #[repr(C)]
 pub struct lzma_options_bcj {
     pub start_offset: u32,
+}
+
+#[repr(C)]
+pub struct lzma_index {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct lzma_index_iter {
+    pub stream: lzma_index_iter_stream,
+    pub block: lzma_index_iter_block,
+    internal: [lzma_index_iter_internal; 6],
+}
+
+#[repr(C)]
+union lzma_index_iter_internal {
+    p: *const c_void,
+    s: size_t,
+    v: lzma_vli,
+}
+
+#[repr(C)]
+pub struct lzma_index_iter_stream {
+    /// Pointer to stream flags.
+    pub flags: *const lzma_stream_flags,
+    reserved_ptr1: *const c_void,
+    reserved_ptr2: *const c_void,
+    reserved_ptr3: *const c_void,
+    /// Stream number if the `lzma_index`.
+    pub number: lzma_vli,
+    /// Number of blocks in the stream.
+    pub block_count: lzma_vli,
+    /// Compressed start offset of this stream.
+    pub compressed_offset: lzma_vli,
+    /// Uncompressed start offset of this stream.
+    pub uncompressed_offset: lzma_vli,
+    /// Compressed size of this stream.
+    pub compressed_size: lzma_vli,
+    /// Uncompressed size of this stream.
+    pub uncompressed_size: lzma_vli,
+    /// Size of stream padding after this stream.
+    pub padding: lzma_vli,
+    reserved_vli1: lzma_vli,
+    reserved_vli2: lzma_vli,
+    reserved_vli3: lzma_vli,
+    reserved_vli4: lzma_vli,
+}
+
+impl PartialEq for lzma_index_iter_stream {
+    fn eq(&self, other: &lzma_index_iter_stream) -> bool {
+        self.number == other.number
+            && self.block_count == other.block_count
+            && self.compressed_offset == other.compressed_offset
+            && self.uncompressed_offset == other.uncompressed_offset
+            && self.compressed_size == other.compressed_size
+            && self.uncompressed_size == other.uncompressed_size
+            && self.padding == other.padding
+    }
+}
+
+#[repr(C)]
+pub struct lzma_index_iter_block {
+    /// Block number in the file.
+    pub number_in_file: lzma_vli,
+    /// Compressed start offset of this block.
+    pub compressed_file_offset: lzma_vli,
+    /// Uncompressed start offset of this block.
+    pub uncompressed_file_offset: lzma_vli,
+    /// Block number in this stream.
+    pub number_in_stream: lzma_vli,
+    /// Compressed start offset of this block.
+    pub compressed_stream_offset: lzma_vli,
+    /// Uncompressed start offset of this block.
+    pub uncompressed_stream_offset: lzma_vli,
+    /// Uncompressed size of this block.
+    pub uncompressed_size: lzma_vli,
+    /// Unpadded size of this block.
+    pub unpadded_size: lzma_vli,
+    /// Total compressed size.
+    pub total_size: lzma_vli,
+    reserved_vli1: lzma_vli,
+    reserved_vli2: lzma_vli,
+    reserved_vli3: lzma_vli,
+    reserved_vli4: lzma_vli,
+    reserved_ptr1: *const c_void,
+    reserved_ptr2: *const c_void,
+    reserved_ptr3: *const c_void,
+    reserved_ptr4: *const c_void,
+}
+
+impl PartialEq for lzma_index_iter_block {
+    fn eq(&self, other: &lzma_index_iter_block) -> bool {
+        self.number_in_file == other.number_in_file
+            && self.compressed_file_offset == other.compressed_file_offset
+            && self.uncompressed_file_offset == other.uncompressed_file_offset
+            && self.number_in_stream == other.number_in_stream
+            && self.compressed_stream_offset == other.compressed_stream_offset
+            && self.uncompressed_stream_offset == other.uncompressed_stream_offset
+            && self.uncompressed_size == other.uncompressed_size
+            && self.unpadded_size == other.unpadded_size
+            && self.total_size == other.total_size
+    }
 }
 
 extern "C" {
@@ -358,4 +468,41 @@ extern "C" {
 
     pub fn lzma_lzma_preset(options: *mut lzma_options_lzma, preset: u32) -> lzma_bool;
     pub fn lzma_mf_is_supported(mf: lzma_match_finder) -> lzma_bool;
+
+    pub fn lzma_index_init(allocator: *const lzma_allocator) -> *mut lzma_index;
+    pub fn lzma_index_end(index: *mut lzma_index, allocator: *const lzma_allocator);
+    pub fn lzma_index_append(
+        index: *mut lzma_index,
+        allocator: *const lzma_allocator,
+        unpadded_size: lzma_vli,
+        uncompressed_size: lzma_vli,
+    ) -> lzma_ret;
+    pub fn lzma_index_cat(
+        dest: *mut lzma_index,
+        src: *mut lzma_index,
+        allocator: *const lzma_allocator,
+    ) -> lzma_ret;
+    pub fn lzma_index_decoder(
+        stream: *mut lzma_stream,
+        index: *mut *mut lzma_index,
+        memlimit: u64,
+    ) -> lzma_ret;
+    pub fn lzma_index_total_size(index: *const lzma_index) -> lzma_vli;
+    pub fn lzma_index_block_count(index: *const lzma_index) -> lzma_vli;
+    pub fn lzma_index_uncompressed_size(index: *const lzma_index) -> lzma_vli;
+    pub fn lzma_index_size(index: *const lzma_index) -> lzma_vli;
+    pub fn lzma_index_stream_size(index: *const lzma_index) -> lzma_vli;
+    pub fn lzma_index_stream_flags(
+        index: *mut lzma_index,
+        stream_flags: *const lzma_stream_flags,
+    ) -> lzma_ret;
+    pub fn lzma_index_stream_padding(index: *mut lzma_index, stream_padding: lzma_vli) -> lzma_ret;
+
+    pub fn lzma_index_iter_init(iter: *mut lzma_index_iter, index: *const lzma_index);
+    pub fn lzma_index_iter_rewind(iter: *mut lzma_index_iter);
+    pub fn lzma_index_iter_next(
+        iter: *mut lzma_index_iter,
+        mode: lzma_index_iter_mode,
+    ) -> lzma_bool;
+    pub fn lzma_index_iter_locate(iter: *mut lzma_index_iter, target: lzma_vli) -> lzma_bool;
 }
