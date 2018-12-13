@@ -8,8 +8,11 @@ use std::collections::LinkedList;
 use std::error;
 use std::fmt;
 use std::io;
+use std::io::{Read, Seek, SeekFrom};
 use std::mem;
+use std::ptr;
 use std::slice;
+use std::u64;
 
 use lzma_sys;
 
@@ -359,6 +362,20 @@ impl Stream {
             let mut init = Stream { raw: mem::zeroed() };
             cvt(lzma_sys::lzma_auto_decoder(&mut init.raw, memlimit, flags))?;
             Ok(init)
+        }
+    }
+
+    /// TODO
+    pub fn new_index_decoder(index: &mut Index, memlimit: u64) -> Result<Stream, Error> {
+        let mut p = index.raw as *mut lzma_sys::lzma_index;
+        unsafe {
+            let mut stream = Stream { raw: mem::zeroed() };
+            cvt(lzma_sys::lzma_index_decoder(
+                &mut stream.raw,
+                &mut p,
+                memlimit,
+            ))?;
+            Ok(stream)
         }
     }
 
@@ -837,5 +854,438 @@ impl Drop for Stream {
         unsafe {
             lzma_sys::lzma_end(&mut self.raw);
         }
+    }
+}
+
+/// TODO
+pub struct Block {
+    raw: lzma_sys::lzma_block,
+}
+
+impl Block {
+    /// Decode a block from a buffer.
+    pub fn from_buf(buf: &[u8], iter: &IndexIter) -> Result<Self, Error> {
+        if buf[0] == 0 {
+            return Err(Error::Options);
+        }
+        let mut block: Block = unsafe { std::mem::zeroed() };
+        block.raw.version = 0;
+        block.raw.check = unsafe { (*iter.stream().flags).check };
+        block.raw.header_size = lzma_sys::lzma_block_header_size_decode(buf[0]);
+        unsafe {
+            cvt(lzma_sys::lzma_block_header_decode(
+                &mut block.raw,
+                ptr::null(),
+                buf.as_ptr(),
+            ))?;
+            cvt(lzma_sys::lzma_block_compressed_size(
+                &mut block.raw,
+                iter.block().unpadded_size,
+            ))?;
+        }
+        block.raw.uncompressed_size = iter.block().uncompressed_size;
+        Ok(block)
+    }
+}
+
+/// An index of blocks.
+///
+/// An xz stream consists of one or more blocks. An `Index` makes it possible to seek between
+/// blocks instantly, which can be used to implement reasonably fast seeking in an xz stream.
+pub struct Index {
+    raw: *mut lzma_sys::lzma_index,
+}
+
+impl Index {
+    /// Create an empty index.
+    pub fn new() -> Self {
+        let index = unsafe { lzma_sys::lzma_index_init(ptr::null()) };
+        assert!(!index.is_null());
+        Self { raw: index }
+    }
+
+    /// Scan indicies from the `Read`er backwareds and return a combined index.
+    pub fn from_reader<R: Read + Seek>(rdr: &mut R) -> Result<Self, Error> {
+        let mut combined_index = Index::new();
+        let mut buf = Buffer::new();
+
+        let mut pos = rdr.seek(SeekFrom::End(0)).or(Err(Error::Data))?;
+        loop {
+            if pos < 2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) {
+                return Err(Error::Data);
+            }
+            pos -= u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE);
+            let mut stream_padding = 0;
+            loop {
+                if pos < u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) {
+                    return Err(Error::Data);
+                }
+                rdr.seek(SeekFrom::Start(pos)).or(Err(Error::Data))?;
+                rdr.read_exact(unsafe {
+                    &mut buf.u8[0..lzma_sys::LZMA_STREAM_HEADER_SIZE as usize]
+                })
+                .or(Err(Error::Data))?;
+                let mut i = 2;
+                if unsafe { buf.u32[i] } != 0 {
+                    break;
+                }
+                loop {
+                    stream_padding += 4;
+                    pos -= 4;
+                    i -= 1;
+                    if i == 0 || unsafe { buf.u32[i] } != 0 {
+                        break;
+                    }
+                }
+            }
+            let footer_flags = StreamFlags::decode_footer(unsafe { &buf.u8 })?;
+
+            if footer_flags.version() != 0 {
+                return Err(Error::Data);
+            }
+
+            let mut index_size = footer_flags.backward_size();
+            if pos < index_size + u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) {
+                return Err(Error::Data);
+            }
+
+            pos -= index_size;
+
+            // TODO: set memlimit here?
+
+            let mut index = Index::new();
+            let mut stream = Stream::new_index_decoder(&mut index, u64::MAX)?;
+
+            loop {
+                let avail_in = BUFFER_SIZE.min(index_size as usize);
+                rdr.seek(SeekFrom::Start(pos)).or(Err(Error::Program))?;
+                rdr.read_exact(unsafe { &mut buf.u8[0..avail_in] })
+                    .or(Err(Error::Data))?;
+                pos += avail_in as u64;
+                index_size -= avail_in as u64;
+                match stream.process(unsafe { &buf.u8[0..avail_in] }, &mut [], Action::Run)? {
+                    Status::Ok => continue,
+                    Status::StreamEnd => {
+                        if index_size != 0 || stream.raw.avail_in != 0 {
+                            return Err(Error::Data);
+                        }
+                        break;
+                    }
+                    _ => return Err(Error::Data),
+                }
+            }
+
+            pos -= footer_flags.backward_size() + u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE);
+            if pos < index.total_size() {
+                return Err(Error::Data);
+            }
+
+            pos -= index.total_size();
+            rdr.seek(SeekFrom::Start(pos)).or(Err(Error::Data))?;
+            rdr.read_exact(unsafe { &mut buf.u8[0..lzma_sys::LZMA_STREAM_HEADER_SIZE as usize] })
+                .or(Err(Error::Data))?;
+
+            let header_flags = StreamFlags::decode_header(unsafe { &buf.u8 })?;
+            if !header_flags.compare(&footer_flags)? {
+                return Err(Error::Data);
+            }
+            index.set_stream_flags(&footer_flags)?;
+            index.set_stream_padding(stream_padding)?;
+            index.append(&mut combined_index)?;
+            combined_index = index;
+
+            if pos == 0 {
+                break;
+            }
+        }
+        Ok(combined_index)
+    }
+
+    /// Add a new block to index.
+    pub fn add_block(&mut self, unpadded_size: u64, uncompressed_size: u64) -> Result<(), Error> {
+        unsafe {
+            cvt(lzma_sys::lzma_index_append(
+                self.raw,
+                ptr::null(),
+                unpadded_size,
+                uncompressed_size,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Concatenate the `other` index into self. There will be nothing left in `other` after this
+    /// operation.
+    pub fn append(&mut self, other: &mut Index) -> Result<Status, Error> {
+        unsafe { cvt(lzma_sys::lzma_index_cat(self.raw, other.raw, ptr::null())) }
+    }
+
+    /// Set the stream flags.
+    pub fn set_stream_flags(&mut self, stream_flags: &StreamFlags) -> Result<(), Error> {
+        unsafe {
+            cvt(lzma_sys::lzma_index_stream_flags(
+                self.raw,
+                &stream_flags.raw,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Set the amount of stream padding.
+    pub fn set_stream_padding(&mut self, stream_padding: u64) -> Result<(), Error> {
+        unsafe {
+            cvt(lzma_sys::lzma_index_stream_padding(
+                self.raw,
+                stream_padding,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Get the total size of the blocks.
+    pub fn total_size(&self) -> u64 {
+        unsafe { lzma_sys::lzma_index_total_size(self.raw) }
+    }
+
+    /// Get the number of blocks.
+    pub fn block_count(&self) -> u64 {
+        unsafe { lzma_sys::lzma_index_block_count(self.raw) }
+    }
+
+    /// Get the uncompressed size of the file.
+    pub fn uncompressed_size(&self) -> u64 {
+        unsafe { lzma_sys::lzma_index_uncompressed_size(self.raw) }
+    }
+
+    /// Get the size of the index field as bytes.
+    pub fn size(&self) -> u64 {
+        unsafe { lzma_sys::lzma_index_size(self.raw) }
+    }
+
+    /// Get the total size of the stream.
+    pub fn stream_size(&self) -> u64 {
+        unsafe { lzma_sys::lzma_index_stream_size(self.raw) }
+    }
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        unsafe {
+            lzma_sys::lzma_index_end(self.raw, ptr::null());
+        }
+    }
+}
+
+impl PartialEq for Index {
+    fn eq(&self, other: &Index) -> bool {
+        let mut iter1 = IndexIter::new(self);
+        let mut iter2 = IndexIter::new(other);
+
+        loop {
+            let ret1 = iter1.next(IndexIterMode::Any);
+            let ret2 = iter2.next(IndexIterMode::Any);
+            if ret1 {
+                return !(ret1 ^ ret2);
+            }
+
+            if iter1.stream() != iter2.stream() {
+                return false;
+            }
+
+            if iter1.stream().block_count == 0 {
+                continue;
+            }
+
+            if iter1.block() != iter2.block() {
+                return false;
+            }
+        }
+    }
+}
+
+const BUFFER_SIZE: usize = 8192;
+
+union Buffer {
+    u8: [u8; BUFFER_SIZE],
+    u32: [u32; BUFFER_SIZE / std::mem::size_of::<u32>()],
+}
+
+impl Buffer {
+    fn new() -> Self {
+        Self {
+            u8: [0; BUFFER_SIZE],
+        }
+    }
+}
+
+/// Options for encoding/decoding stream header and stream footer.
+pub struct StreamFlags {
+    raw: lzma_sys::lzma_stream_flags,
+}
+
+impl StreamFlags {
+    /// Decode stream header flags.
+    pub fn decode_header(input: &[u8]) -> Result<Self, Error> {
+        let mut header_flags: StreamFlags = unsafe { mem::zeroed() };
+        unsafe {
+            cvt(lzma_sys::lzma_stream_header_decode(
+                &mut header_flags.raw,
+                input.as_ptr(),
+            ))?;
+        }
+        Ok(header_flags)
+    }
+
+    /// Decode stream footer flags.
+    pub fn decode_footer(input: &[u8]) -> Result<Self, Error> {
+        let mut footer_flags: StreamFlags = unsafe { mem::zeroed() };
+        unsafe {
+            cvt(lzma_sys::lzma_stream_footer_decode(
+                &mut footer_flags.raw,
+                input.as_ptr(),
+            ))?;
+        }
+        Ok(footer_flags)
+    }
+
+    /// Compare two stream flags. Return `Ok(true)` if they match.
+    pub fn compare(&self, other: &StreamFlags) -> Result<bool, Error> {
+        let ret = unsafe { cvt(lzma_sys::lzma_stream_flags_compare(&self.raw, &other.raw))? };
+        Ok(ret == Status::Ok)
+    }
+
+    /// Get stream flags format version.
+    pub fn version(&self) -> u32 {
+        self.raw.version
+    }
+
+    /// Get backward size, which is the sizeo f the index field.
+    pub fn backward_size(&self) -> u64 {
+        self.raw.backward_size
+    }
+}
+
+/// TODO
+pub struct IndexIter {
+    raw: lzma_sys::lzma_index_iter,
+}
+
+impl IndexIter {
+    /// TODO
+    pub fn new(index: &Index) -> Self {
+        let mut raw = unsafe { mem::zeroed() };
+        unsafe { lzma_sys::lzma_index_iter_init(&mut raw, index.raw) }
+        Self { raw }
+    }
+
+    /// TODO
+    pub fn rewind(&mut self) {
+        unsafe { lzma_sys::lzma_index_iter_rewind(&mut self.raw) }
+    }
+
+    /// TODO
+    pub fn next(&mut self, mode: IndexIterMode) -> bool {
+        let ret = unsafe { lzma_sys::lzma_index_iter_next(&mut self.raw, mode as u32) };
+        ret == 1
+    }
+
+    /// TODO
+    pub fn locate(&mut self, target: u64) -> bool {
+        let ret = unsafe { lzma_sys::lzma_index_iter_locate(&mut self.raw, target) };
+        ret == 1
+    }
+
+    /// TODO
+    pub fn stream(&self) -> &lzma_sys::lzma_index_iter_stream {
+        &self.raw.stream
+    }
+
+    /// TODO
+    pub fn block(&self) -> &lzma_sys::lzma_index_iter_block {
+        &self.raw.block
+    }
+}
+
+/// Operation mode for `IndexIter`.
+pub enum IndexIterMode {
+    /// Get the next block or stream.
+    Any = lzma_sys::LZMA_INDEX_ITER_ANY as isize,
+    /// Get the next stream.
+    Stream = lzma_sys::LZMA_INDEX_ITER_STREAM as isize,
+    /// Get the next block.
+    Block = lzma_sys::LZMA_INDEX_ITER_BLOCK as isize,
+    /// Get the next non-empty block.
+    NonEmptyBlock = lzma_sys::LZMA_INDEX_ITER_NONEMPTY_BLOCK as isize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::Wrapping;
+
+    const SMALL_COUNT: u64 = 3;
+    const BIG_COUNT: u64 = 5555;
+
+    fn create_empty() -> Index {
+        Index::new()
+    }
+
+    fn create_small() -> Index {
+        let mut index = Index::new();
+        index.add_block(101, 555).unwrap();
+        index.add_block(602, 777).unwrap();
+        index.add_block(804, 999).unwrap();
+        index
+    }
+
+    fn create_big() -> Index {
+        let mut index = Index::new();
+        let mut total_size: u64 = 0;
+        let mut uncompressed_size: u64 = 0;
+
+        let mut n: Wrapping<u32> = Wrapping(11);
+        for j in 0..BIG_COUNT {
+            n = Wrapping(7019) * n + Wrapping(7607);
+            let t = n * Wrapping(3011);
+            println!("({},{},{})", j, n, t);
+            index.add_block(u64::from(t.0), u64::from(n.0)).unwrap();
+            total_size += (u64::from(t.0) + 3) & !3;
+            uncompressed_size += u64::from(n.0);
+        }
+        assert!(index.block_count() == BIG_COUNT);
+        assert!(index.total_size() == total_size);
+        assert!(index.uncompressed_size() == uncompressed_size);
+        assert!(
+            index.total_size() + index.size() + 2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE)
+                == index.stream_size()
+        );
+        index
+    }
+
+    #[test]
+    fn test_equal() {
+        let a = create_empty();
+        let b = create_small();
+        let c = create_big();
+
+        assert!(a == a);
+        assert!(b == b);
+        assert!(c == c);
+
+        assert!(a != b);
+        assert!(a != c);
+        assert!(b != c);
+    }
+
+    #[test]
+    fn test_overflow() {
+        let mut index = create_empty();
+        assert!(index.add_block(u64::MAX - 5, 1234) == Err(Error::Data));
     }
 }
