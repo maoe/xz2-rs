@@ -9,7 +9,7 @@ use futures::Poll;
 #[cfg(feature = "tokio")]
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use stream::{Action, Check, Status, Stream};
+use stream::{Action, Check, Index, IndexIter, Status, Stream};
 
 /// An xz encoder, or compressor.
 ///
@@ -27,6 +27,12 @@ pub struct XzEncoder<R> {
 pub struct XzDecoder<R> {
     obj: R,
     data: Stream,
+}
+
+/// TODO
+pub struct XzSeekableDecoder<R> {
+    decoder: XzDecoder<R>,
+    index: Index,
 }
 
 impl<R: BufRead> XzEncoder<R> {
@@ -167,6 +173,59 @@ impl<R: BufRead> XzDecoder<R> {
     }
 }
 
+impl<R: BufRead + Seek> XzSeekableDecoder<R> {
+    /// TODO
+    pub fn new(mut r: R) -> io::Result<XzSeekableDecoder<R>> {
+        let index = Index::from_reader(&mut r)?;
+        Ok(XzSeekableDecoder {
+            decoder: XzDecoder::new(r),
+            index,
+        })
+    }
+}
+
+impl<R: BufRead> Read for XzSeekableDecoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.decoder.read(buf)
+    }
+}
+
+impl<R: Read + Seek> Seek for XzSeekableDecoder<R> {
+    fn seek(&mut self, target: io::SeekFrom) -> io::Result<u64> {
+        let r = self.decoder.get_mut();
+        let target_pos = match target {
+            io::SeekFrom::Current(offset) | io::SeekFrom::End(offset) => {
+                let current_pos = r.seek(io::SeekFrom::Current(0))?;
+                if offset > 0 {
+                    current_pos + offset as u64
+                } else {
+                    current_pos - (offset.abs() as u64)
+                }
+            }
+            io::SeekFrom::Start(pos) => pos,
+        };
+        let mut iter = IndexIter::new(&self.index);
+
+        // Locate the beginning of the block at the requested position.
+        if iter.locate(target_pos) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid offset {}", target_pos),
+            ));
+        }
+        let compressed_block_pos = iter.block().compressed_file_offset;
+        let uncompressed_block_pos = iter.block().uncompressed_file_offset;
+        let bytes_to_skip = uncompressed_block_pos - target_pos;
+
+        // Seek to the beginning of the block.
+        r.seek(io::SeekFrom::Start(compressed_block_pos))?;
+
+        let mut buf = Vec::with_capacity(bytes_to_skip as usize);
+        r.read_exact(&mut buf)?;
+        Ok(target_pos)
+    }
+}
+
 impl<R> XzDecoder<R> {
     /// Acquires a reference to the underlying stream
     pub fn get_ref(&self) -> &R {
@@ -295,4 +354,14 @@ mod tests {
         assert_eq!(nb_read, ADDITIONAL_SIZE);
         assert_eq!(remaining_data, &additional_data[..]);
     }
+
+    // #[test]
+    // fn seek_and_continue() {
+    //     let mut to_compress: Vec<u8> = Vec::new();
+    //     const COMPRESSED_ORIG_SIZE: usize = 1024;
+    //     for num in 0..COMPRESSED_ORIG_SIZE {
+    //         to_compress.push(num as u8);
+    //     }
+    //
+    // }
 }
