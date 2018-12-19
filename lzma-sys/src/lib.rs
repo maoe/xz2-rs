@@ -96,6 +96,11 @@ pub const LZMA_FILTER_LZMA2: lzma_vli = 0x21;
 
 pub const LZMA_STREAM_HEADER_SIZE: u32 = 12;
 
+pub const LZMA_BLOCK_HEADER_SIZE_MAX: u32 = 8;
+pub const LZMA_BLOCK_HEADER_SIZE_MIN: u32 = 1024;
+
+pub const LZMA_CHECK_SIZE_MAX: usize = 64;
+
 pub const LZMA_INDEX_ITER_ANY: lzma_index_iter_mode = 0;
 pub const LZMA_INDEX_ITER_STREAM: lzma_index_iter_mode = 1;
 pub const LZMA_INDEX_ITER_BLOCK: lzma_index_iter_mode = 2;
@@ -221,6 +226,49 @@ pub struct lzma_stream_flags {
 #[repr(C)]
 pub struct lzma_options_bcj {
     pub start_offset: u32,
+}
+
+#[repr(C)]
+/// Options for the block and block header encoders and decoders.
+pub struct lzma_block {
+    /// Block format version.
+    pub version: u32,
+    /// Size of the block header field.
+    pub header_size: u32,
+    /// Type of integrity check.
+    pub check: lzma_check,
+    /// Size of the compressed data in bytes.
+    pub compressed_size: lzma_vli,
+    /// Uncompressed size in bytes.
+    pub uncompressed_size: lzma_vli,
+    /// Array of filters.
+    pub filters: *const lzma_filter,
+    /// Raw value stored in the check field.
+    pub raw_check: [u8; LZMA_CHECK_SIZE_MAX],
+    reserved_ptr1: *mut c_void,
+    reserved_ptr2: *mut c_void,
+    reserved_ptr3: *mut c_void,
+    reserved_int1: u32,
+    reserved_int2: u32,
+    reserved_int3: lzma_vli,
+    reserved_int4: lzma_vli,
+    reserved_int5: lzma_vli,
+    reserved_int6: lzma_vli,
+    reserved_int7: lzma_vli,
+    reserved_int8: lzma_vli,
+    reserved_enum1: lzma_reserved_enum,
+    reserved_enum2: lzma_reserved_enum,
+    reserved_enum3: lzma_reserved_enum,
+    reserved_enum4: lzma_reserved_enum,
+    /// A flag to block decoder to not verify the check field
+    ignore_check: lzma_bool,
+    reserved_bool2: lzma_bool,
+    reserved_bool3: lzma_bool,
+    reserved_bool4: lzma_bool,
+    reserved_bool5: lzma_bool,
+    reserved_bool6: lzma_bool,
+    reserved_bool7: lzma_bool,
+    reserved_bool8: lzma_bool,
 }
 
 #[repr(C)]
@@ -469,6 +517,13 @@ extern "C" {
     pub fn lzma_lzma_preset(options: *mut lzma_options_lzma, preset: u32) -> lzma_bool;
     pub fn lzma_mf_is_supported(mf: lzma_match_finder) -> lzma_bool;
 
+    pub fn lzma_block_header_decode(
+        block: *mut lzma_block,
+        allocator: *const lzma_allocator,
+        input: *const u8,
+    ) -> lzma_ret;
+    pub fn lzma_block_compressed_size(block: *mut lzma_block, unpadded_size: lzma_vli) -> lzma_ret;
+
     pub fn lzma_index_init(allocator: *const lzma_allocator) -> *mut lzma_index;
     pub fn lzma_index_end(index: *mut lzma_index, allocator: *const lzma_allocator);
     pub fn lzma_index_append(
@@ -505,4 +560,9 @@ extern "C" {
         mode: lzma_index_iter_mode,
     ) -> lzma_bool;
     pub fn lzma_index_iter_locate(iter: *mut lzma_index_iter, target: lzma_vli) -> lzma_bool;
+}
+
+/// Decode the block header size field.
+pub fn lzma_block_header_size_decode(b: u8) -> u32 {
+    (u32::from(b) + 1) * 4
 }
