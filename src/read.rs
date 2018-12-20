@@ -1,7 +1,7 @@
 //! Reader-based compression/decompression streams
 
 use std::io::prelude::*;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, SeekFrom};
 
 #[cfg(feature = "tokio")]
 use futures::Poll;
@@ -21,6 +21,12 @@ pub struct XzEncoder<R: Read> {
 /// data will be read from the stream.
 pub struct XzDecoder<R: Read> {
     inner: bufread::XzDecoder<BufReader<R>>,
+}
+
+/// A seekable decompression stream which wraps a compressed stream of data.
+/// Decompressed data will be read from the stream.
+pub struct XzSeekableDecoder<R: Read> {
+    inner: bufread::XzSeekableDecoder<BufReader<R>>,
 }
 
 impl<R: Read> XzEncoder<R> {
@@ -176,6 +182,18 @@ impl<R: Read> XzDecoder<R> {
 impl<R: Read> Read for XzDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
+    }
+}
+
+impl<R: Read> Read for XzSeekableDecoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read + Seek> Seek for XzSeekableDecoder<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 
