@@ -450,6 +450,21 @@ impl Stream {
     }
 }
 
+impl fmt::Debug for Stream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f,
+            "Stream {{ next_in: {:?}, avail_in: {}, total_in: {}, next_out: {:?}, avail_out: {}, total_out: {}, allocator: {:?} }}",
+            self.raw.next_in,
+            self.raw.avail_in,
+            self.raw.total_in,
+            self.raw.next_out,
+            self.raw.avail_out,
+            self.raw.total_out,
+            self.raw.allocator,
+        )
+    }
+}
+
 impl LzmaOptions {
     /// Creates a new blank set of options for encoding.
     ///
@@ -1168,6 +1183,18 @@ impl StreamFlags {
     /// Get backward size, which is the sizeo f the index field.
     pub fn backward_size(&self) -> u64 {
         self.raw.backward_size
+    }
+}
+
+impl fmt::Debug for StreamFlags {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(
+            f,
+            "StreamFlags {{ version: {}, backward_size: {}, check: {:?} }}",
+            self.version(),
+            self.backward_size(),
+            self.raw.check
+        )
     }
 }
 
