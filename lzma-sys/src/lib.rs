@@ -537,6 +537,10 @@ extern "C" {
         src: *mut lzma_index,
         allocator: *const lzma_allocator,
     ) -> lzma_ret;
+    pub fn lzma_index_dup(
+        index: *const lzma_index,
+        allocator: *const lzma_allocator,
+    ) -> *mut lzma_index;
     pub fn lzma_index_decoder(
         stream: *mut lzma_stream,
         index: *mut *mut lzma_index,
@@ -547,6 +551,7 @@ extern "C" {
     pub fn lzma_index_uncompressed_size(index: *const lzma_index) -> lzma_vli;
     pub fn lzma_index_size(index: *const lzma_index) -> lzma_vli;
     pub fn lzma_index_stream_size(index: *const lzma_index) -> lzma_vli;
+    pub fn lzma_index_file_size(index: *const lzma_index) -> lzma_vli;
     pub fn lzma_index_stream_flags(
         index: *mut lzma_index,
         stream_flags: *const lzma_stream_flags,
