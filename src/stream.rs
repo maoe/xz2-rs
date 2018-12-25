@@ -1006,7 +1006,7 @@ impl Index {
             }
             index.set_stream_flags(&footer_flags)?;
             index.set_stream_padding(stream_padding)?;
-            index.append(&mut combined_index)?;
+            index.append(combined_index)?;
             combined_index = index;
 
             if pos == 0 {
@@ -1031,8 +1031,14 @@ impl Index {
 
     /// Concatenate the `other` index into self. There will be nothing left in `other` after this
     /// operation.
-    pub fn append(&mut self, other: &mut Index) -> Result<Status, Error> {
-        unsafe { cvt(lzma_sys::lzma_index_cat(self.raw, other.raw, ptr::null())) }
+    pub fn append(&mut self, other: Index) -> Result<Status, Error> {
+        let status = unsafe { cvt(lzma_sys::lzma_index_cat(self.raw, other.raw, ptr::null()))? };
+        match status {
+            // Skip destructor for `other` because `lzma_index_cat` frees it when it succeeds.
+            Status::Ok => std::mem::forget(other),
+            _ => {}
+        }
+        Ok(status)
     }
 
     /// Set the stream flags.
