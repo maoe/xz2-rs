@@ -1087,6 +1087,11 @@ impl Index {
     pub fn stream_size(&self) -> u64 {
         unsafe { lzma_sys::lzma_index_stream_size(self.raw) }
     }
+
+    /// Get the total size of the file.
+    pub fn file_size(&self) -> u64 {
+        unsafe { lzma_sys::lzma_index_file_size(self.raw) }
+    }
 }
 
 impl Default for Index {
@@ -1127,6 +1132,13 @@ impl PartialEq for Index {
                 return false;
             }
         }
+    }
+}
+
+impl Clone for Index {
+    fn clone(&self) -> Self {
+        let raw = unsafe { lzma_sys::lzma_index_dup(self.raw, ptr::null()) };
+        Self { raw }
     }
 }
 
@@ -1301,8 +1313,43 @@ mod tests {
         index
     }
 
+    fn test_clone(index: &Index) {
+        let cloned_index = index.clone();
+        assert!(index == &cloned_index);
+    }
+
+    fn test_read(index: &Index) {
+        let mut iter = IndexIter::new(index);
+        for _ in 0..2 {
+            let mut total_size = 0;
+            let mut uncompressed_size = 0;
+            let mut stream_offset = u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE);
+            let mut uncompressed_offset = 0;
+            let mut count = 0;
+
+            while !iter.next(IndexIterMode::Block) {
+                count += 1;
+
+                total_size += iter.block().total_size;
+                uncompressed_size += iter.block().uncompressed_size;
+
+                assert!(iter.block().compressed_file_offset == stream_offset);
+                assert!(iter.block().uncompressed_file_offset == uncompressed_offset);
+
+                stream_offset += iter.block().total_size;
+                uncompressed_offset += iter.block().uncompressed_size;
+            }
+
+            assert!(index.total_size() == total_size);
+            assert!(index.uncompressed_size() == uncompressed_size);
+            assert!(index.block_count() == count);
+
+            iter.rewind();
+        }
+    }
+
     #[test]
-    fn test_equal() {
+    fn equal() {
         let a = create_empty();
         let b = create_small();
         let c = create_big();
@@ -1317,8 +1364,170 @@ mod tests {
     }
 
     #[test]
-    fn test_overflow() {
+    fn overflow() {
         let mut index = create_empty();
         assert!(index.add_block(u64::MAX - 5, 1234) == Err(Error::Data));
+    }
+
+    #[test]
+    fn clone() {
+        let a = create_empty();
+        let b = create_small();
+        let c = create_big();
+
+        test_clone(&a);
+        test_clone(&b);
+        test_clone(&c);
+    }
+
+    #[test]
+    fn read() {
+        let a = create_empty();
+        let b = create_small();
+        let c = create_big();
+
+        test_read(&a);
+        test_read(&b);
+        test_read(&c);
+    }
+
+    #[test]
+    fn append_empty() {
+        let mut a = create_empty();
+        let b = create_empty();
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.block_count(), 0);
+        assert_eq!(
+            a.stream_size(),
+            2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8
+        );
+        assert_eq!(
+            a.file_size(),
+            2 * (2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8)
+        );
+        let mut r = IndexIter::new(&a);
+        assert!(r.next(IndexIterMode::Block));
+
+        let b = create_empty();
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.block_count(), 0);
+        assert_eq!(
+            a.stream_size(),
+            2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8
+        );
+        assert_eq!(
+            a.file_size(),
+            3 * (2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8)
+        );
+
+        let mut b = create_empty();
+        let c = create_empty();
+        assert!(b.set_stream_padding(4) == Ok(()));
+        assert_eq!(b.append(c), Ok(Status::Ok));
+        assert_eq!(b.block_count(), 0);
+        assert_eq!(
+            b.stream_size(),
+            2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8
+        );
+        assert_eq!(
+            b.file_size(),
+            2 * (2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8) + 4
+        );
+
+        assert_eq!(a.set_stream_padding(8), Ok(()));
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.block_count(), 0);
+        assert_eq!(
+            a.stream_size(),
+            2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8
+        );
+        assert_eq!(
+            a.file_size(),
+            5 * (2 * u64::from(lzma_sys::LZMA_STREAM_HEADER_SIZE) + 8) + 4 + 8
+        );
+
+        assert!(r.next(IndexIterMode::Block));
+        r.rewind();
+        assert!(r.next(IndexIterMode::Block));
+    }
+
+    #[test]
+    fn append_small() {
+        let mut a = create_small();
+        let stream_size = a.stream_size();
+        let mut r = IndexIter::new(&a);
+        for i in SMALL_COUNT..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
+
+        let b = create_small();
+        assert_eq!(a.set_stream_padding(4), Ok(()));
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.file_size(), stream_size * 2 + 4);
+        assert!(a.stream_size() > stream_size);
+        assert!(a.stream_size() < stream_size * 2);
+        for i in SMALL_COUNT..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
+
+        r.rewind();
+        for i in 2 * SMALL_COUNT..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
+
+        let mut b = create_small();
+        let c = create_small();
+        assert_eq!(b.set_stream_padding(8), Ok(()));
+        assert_eq!(b.append(c), Ok(Status::Ok));
+        assert_eq!(b.set_stream_padding(12), Ok(()));
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.file_size(), stream_size * 4 + 4 + 8 + 12);
+
+        assert_eq!(a.block_count(), SMALL_COUNT * 4);
+        for i in 2 * SMALL_COUNT..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
+
+        r.rewind();
+        for i in 4 * SMALL_COUNT..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
+    }
+
+    #[test]
+    fn append_mix() {
+        let mut a = create_empty();
+        let b = create_small();
+        assert_eq!(a.set_stream_padding(4), Ok(()));
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        let mut r = IndexIter::new(&a);
+        for i in SMALL_COUNT..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
+    }
+
+    #[test]
+    fn append_big() {
+        let mut a = create_big();
+        let stream_size = a.stream_size();
+        let b = create_big();
+        assert_eq!(a.set_stream_padding(4), Ok(()));
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.file_size(), stream_size * 2 + 4);
+        assert!(a.stream_size() > stream_size);
+        assert!(a.stream_size() < stream_size * 2);
+
+        let mut b = create_big();
+        let c = create_big();
+        assert_eq!(a.set_stream_padding(8), Ok(()));
+        assert_eq!(b.append(c), Ok(Status::Ok));
+        assert_eq!(b.set_stream_padding(12), Ok(()));
+        assert_eq!(a.append(b), Ok(Status::Ok));
+        assert_eq!(a.file_size(), stream_size * 4 + 4 + 8 + 12);
+
+        let mut r = IndexIter::new(&a);
+        for i in BIG_COUNT * 4..0 {
+            assert!(!r.next(IndexIterMode::Block) ^ (i == 0));
+        }
     }
 }
